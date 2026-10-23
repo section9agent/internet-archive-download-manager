@@ -1,7 +1,7 @@
 @echo off
-REM Builds ArchiveDownloader.exe (standalone, no Python needed to run it).
+REM Builds InternetArchiveDownloadManager.exe (standalone, no Python needed to run it).
 REM Run this ONCE on a Windows PC that has Python installed.
-REM Put this file in the same folder as archive_downloader.py.
+REM Keep this file next to archive_downloader.py, icon.png and make_icons.py.
 
 setlocal
 cd /d "%~dp0"
@@ -13,16 +13,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Installing PyInstaller...
-python -m pip install --upgrade pyinstaller
+echo Installing build tools...
+python -m pip install --upgrade pyinstaller pillow
+if errorlevel 1 goto :fail
+
+echo Making icon files...
+python make_icons.py
 if errorlevel 1 goto :fail
 
 echo Building...
-python -m PyInstaller --onefile --windowed --clean --name ArchiveDownloader archive_downloader.py
+python -m PyInstaller --onefile --windowed --clean --noconfirm --name InternetArchiveDownloadManager --icon icon.ico --add-data "icon.png;." archive_downloader.py
 if errorlevel 1 goto :fail
 
 echo.
-echo Done! Your program is: %~dp0dist\ArchiveDownloader.exe
+echo Done! Your program is: %~dp0dist\InternetArchiveDownloadManager.exe
 echo You can copy that single file anywhere and share it.
 pause
 exit /b 0

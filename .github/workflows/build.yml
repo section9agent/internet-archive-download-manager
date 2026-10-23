@@ -1,0 +1,91 @@
+name: Build apps
+on:
+  push: { tags: ["v*"] }
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag for the draft (e.g. v1.0.0). Leave empty for a build-number tag."
+        required: false
+        default: ""
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: Windows }
+          - { os: macos-latest,   name: macOS }
+          - { os: ubuntu-22.04,   name: Linux }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Linux Tk libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk tk-dev
+
+      - run: pip install pyinstaller pillow
+      - name: Syntax check
+        run: python -m py_compile archive_downloader.py
+
+      # Make icon.ico (Windows) and icon.icns (macOS) from icon.png
+      - run: python make_icons.py
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pyinstaller --onefile --windowed --clean --noconfirm --name InternetArchiveDownloadManager \
+              --icon icon.ico --add-data "icon.png;." archive_downloader.py
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            pyinstaller --windowed --clean --noconfirm --name InternetArchiveDownloadManager \
+              --icon icon.icns --add-data "icon.png:." archive_downloader.py
+          else
+            pyinstaller --onefile --clean --noconfirm --name InternetArchiveDownloadManager \
+              --add-data "icon.png:." archive_downloader.py
+          fi
+
+      # Put the compressed build in its own folder so only the archive is uploaded
+      - name: Zip
+        shell: bash
+        run: |
+          cd dist
+          mkdir -p ../artifacts-to-upload
+          if [ "$RUNNER_OS" = "Windows" ]; then 7z a ../artifacts-to-upload/InternetArchiveDownloadManager-Windows.zip InternetArchiveDownloadManager.exe;
+          elif [ "$RUNNER_OS" = "macOS" ]; then ditto -c -k --keepParent InternetArchiveDownloadManager.app ../artifacts-to-upload/InternetArchiveDownloadManager-macOS.zip;
+          else tar czf ../artifacts-to-upload/InternetArchiveDownloadManager-Linux.tar.gz InternetArchiveDownloadManager; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InternetArchiveDownloadManager-${{ matrix.name }}
+          path: "artifacts-to-upload/*"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}";
+          elif [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG";
+          else TAG="build-${GITHUB_RUN_NUMBER}"; fi
+          ls -la release-files
+          if gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft 2>/dev/null | grep -q true; then
+            gh release delete "$TAG" --repo "$REPO" --yes
+          fi
+          gh release create "$TAG" release-files/* --repo "$REPO" --draft \
+            --target "${GITHUB_SHA}" --title "Internet Archive Download Manager ${TAG}" \
+            --notes "Windows (.zip), macOS (.zip) and Linux (.tar.gz) builds. Unzip and run InternetArchiveDownloadManager. No Python needed."
