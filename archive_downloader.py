@@ -2,15 +2,19 @@
 """
 Internet Archive Download Manager
 ---------------------------------
-Paste an archive.org item URL (or just the item name), load the file list,
-tick the files you want (or filter by file type), choose a save folder and
-download them. Folder structure inside the archive is preserved.
+Two tabs:
+  * Internet Archive - paste an archive.org item URL (or just the item name).
+  * Open Directory   - paste the address of any open directory website
+                       (the plain "Index of /..." file listings).
+Load the file list, tick the files you want (or filter by file type), choose a
+save folder and download them. Folder structure is preserved.
 
 Requires only Python 3.8+ with tkinter (included with the standard installers
 on Windows and macOS; on Linux install the python3-tk package).
 """
 
 import json
+import html.parser
 import os
 import queue
 import re
@@ -22,6 +26,8 @@ import tkinter.font as tkfont
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "Internet Archive Download Manager"
@@ -131,7 +137,10 @@ def parse_extensions(text):
 def safe_join(base, relative):
     """Join relative archive path onto base, refusing to escape base."""
     rel = relative.replace("\\", "/").lstrip("/")
-    target = os.path.normpath(os.path.join(base, *rel.split("/")))
+    segments = [s for s in rel.split("/") if s]
+    if os.name == "nt":   # characters Windows doesn't allow in file names
+        segments = [re.sub(r'[<>:"|?*]', "_", s).rstrip(" .") or "_" for s in segments]
+    target = os.path.normpath(os.path.join(base, *segments))
     base_abs = os.path.abspath(base)
     if os.path.commonpath([base_abs, os.path.abspath(target)]) != base_abs:
         raise ValueError(f"Unsafe path in archive listing: {relative}")
@@ -145,8 +154,10 @@ def default_save_dir(identifier):
     return os.path.join(root, safe)
 
 
-def open_url(url, headers=None, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+def open_url(url, headers=None, timeout=30, method=None):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, **(headers or {})}, method=method
+    )
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -176,10 +187,9 @@ class DownloadCancelled(Exception):
 
 
 class Downloader(threading.Thread):
-    def __init__(self, identifier, files, dest_dir, events):
+    def __init__(self, files, dest_dir, events):
         super().__init__(daemon=True)
-        self.identifier = identifier
-        self.files = files            # list of dicts: name, size
+        self.files = files            # list of dicts: name, size, url
         self.dest_dir = dest_dir
         self.events = events          # queue.Queue
         self.cancel_flag = threading.Event()
@@ -200,6 +210,7 @@ class Downloader(threading.Thread):
                 if self.cancel_flag.is_set():
                     raise DownloadCancelled()
                 name, size = f["name"], f["size"]
+                exact = f.get("exact", True)
                 self.events.put(("file", name, idx, count, size))
 
                 try:
@@ -210,7 +221,7 @@ class Downloader(threading.Thread):
                     continue
 
                 # Already complete?
-                if os.path.isfile(dest) and size > 0 and os.path.getsize(dest) == size:
+                if exact and os.path.isfile(dest) and size > 0 and os.path.getsize(dest) == size:
                     skipped += 1
                     done_bytes += size
                     self.events.put(("bytes", size, size, done_bytes, total_bytes, 0.0, None))
@@ -220,7 +231,7 @@ class Downloader(threading.Thread):
                 for attempt in range(1, RETRIES + 1):
                     try:
                         got = self._download_one(
-                            name, dest, size, done_bytes, total_bytes, start, session_bytes
+                            f["url"], dest, size, exact, done_bytes, total_bytes, start, session_bytes
                         )
                         session_bytes += got
                         ok += 1
@@ -240,13 +251,9 @@ class Downloader(threading.Thread):
 
         self.events.put(("finished", ok, skipped, failed, False))
 
-    def _download_one(self, name, dest, size, done_before, total_bytes, start, session_before):
+    def _download_one(self, url, dest, size, exact, done_before, total_bytes, start, session_before):
         os.makedirs(os.path.dirname(dest), exist_ok=True)   # keeps the archive's folder structure
         part = dest + ".part"
-        url = (
-            f"https://archive.org/download/{urllib.parse.quote(self.identifier)}/"
-            f"{urllib.parse.quote(name)}"
-        )
 
         offset = os.path.getsize(part) if os.path.exists(part) else 0
         headers = {"Range": f"bytes={offset}-"} if offset > 0 else {}
@@ -267,7 +274,10 @@ class Downloader(threading.Thread):
             mode = "ab" if offset > 0 else "wb"
 
             length = resp.headers.get("Content-Length")
-            file_total = size if size > 0 else (int(length) + offset if length else 0)
+            real_total = int(length) + offset if length and length.isdigit() else 0
+            # the server's own length is the truth; a rounded listing size is only a guess
+            file_total = real_total or (size if size > 0 else 0)
+            expected = real_total or (size if exact and size > 0 else 0)
 
             written = offset
             transferred = 0
@@ -293,8 +303,8 @@ class Downloader(threading.Thread):
                             ("bytes", written, file_total, overall_done, total_bytes, speed, remaining)
                         )
 
-        if size > 0 and written != size:
-            raise IOError(f"Incomplete download ({written} of {size} bytes)")
+        if expected and written != expected:
+            raise IOError(f"Incomplete download ({written} of {expected} bytes)")
         os.replace(part, dest)
         self.events.put(("bytes", written, file_total, done_before + max(size, 0), total_bytes, 0.0, None))
         return transferred
@@ -335,12 +345,16 @@ class ProgressWindow(tk.Toplevel):
         self.withdraw()   # build invisibly, then centre, then show
         self.title("Downloading...")
         self.resizable(False, False)
-        self.transient(parent)
+        # Deliberately NOT transient and no grab: a window tied to the main one hides with it
+        # when the main window is minimised, which made the app impossible to bring back.
         self.app = app
+        app.downloader_window = self
+        app.downloading = True
         self.downloader = downloader
         self.events = events
         self.on_close = on_close
         self.finished = False
+        self.has_total = all(f["size"] > 0 for f in downloader.files)
         self.configure(bg=app.pal["bg"])
 
         pad = {"padx": 14, "pady": 3}
@@ -370,7 +384,7 @@ class ProgressWindow(tk.Toplevel):
         self.center_on(parent)
         self.deiconify()
         set_titlebar_dark(self, app.dark)
-        self.grab_set()
+        self.lift()
         self.after(100, self.poll)
 
     def center_on(self, parent):
@@ -392,7 +406,8 @@ class ProgressWindow(tk.Toplevel):
             self.downloader.cancel()
 
     def close(self):
-        self.grab_release()
+        self.app.downloading = False
+        self.app.downloader_window = None
         self.destroy()
         self.on_close()
 
@@ -414,6 +429,9 @@ class ProgressWindow(tk.Toplevel):
             self.file_label.config(text=f"File {idx} of {count}: {shown}")
             self.file_bar["value"] = 0
             self.file_detail.config(text="")
+            if not self.has_total:   # some sizes unknown: show progress by file count
+                self.total_bar["value"] = (idx - 1) * 100 / count
+                self.total_detail.config(text=f"{idx - 1} of {count} files done")
         elif kind == "bytes":
             _, f_done, f_total, o_done, o_total, speed, remaining = ev
             if f_total > 0:
@@ -421,7 +439,7 @@ class ProgressWindow(tk.Toplevel):
                 self.file_detail.config(text=f"{human_size(f_done)} of {human_size(f_total)}")
             else:
                 self.file_detail.config(text=f"{human_size(f_done)}")
-            if o_total > 0:
+            if o_total > 0 and self.has_total:
                 self.total_bar["value"] = min(100, o_done * 100 / o_total)
                 extra = f"   {human_size(speed)}/s   ETA {human_time(remaining)}" if speed else ""
                 self.total_detail.config(
@@ -451,40 +469,269 @@ class ProgressWindow(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------
+# Getting file lists
+# --------------------------------------------------------------------------
+def fetch_archive_files(ident):
+    """File list of an archive.org item, from its metadata."""
+    url = f"https://archive.org/metadata/{urllib.parse.quote(ident)}"
+    with open_url(url) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not data or "files" not in data:
+        raise ValueError("Item not found, or it has no files.")
+    files = []
+    for f in data["files"]:
+        if str(f.get("private", "")).lower() == "true":
+            continue
+        name = f.get("name")
+        if not name:
+            continue
+        try:
+            size = int(f.get("size", -1))
+        except (TypeError, ValueError):
+            size = -1
+        files.append({
+            "name": name,
+            "size": size,
+            "source": f.get("source", ""),
+            "url": f"https://archive.org/download/{urllib.parse.quote(ident)}/{urllib.parse.quote(name)}",
+        })
+    return files
+
+
+class _LinkParser(html.parser.HTMLParser):
+    """Collects every link on a directory-listing page, plus the text after it
+    (which is where servers put the date and size)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.entries = []      # (href, text after the link)
+        self._cur = None
+        self._in_a = False
+
+    def _close(self):
+        if self._cur:
+            self.entries.append((self._cur[0], " ".join(self._cur[1])))
+        self._cur = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._close()
+            href = dict(attrs).get("href")
+            self._in_a = True
+            if href:
+                self._cur = (href, [])
+        elif tag in ("tr", "li", "br", "hr"):
+            self._close()
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._in_a = False
+        elif tag in ("tr", "li", "pre", "table"):
+            self._close()
+
+    def handle_data(self, data):
+        if self._cur and not self._in_a:
+            self._cur[1].append(data)
+
+    def finish(self):
+        self.close()
+        self._close()
+        return self.entries
+
+
+_UNIT = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
+
+
+def parse_listing_size(text):
+    """Pull a file size out of the text next to a link ('2024-01-02 10:00  4.5M').
+
+    Returns (size, exact). Sizes shown as 4.5M are rounded by the server, so they are
+    only estimates (exact=False); plain byte counts are exact. (-1, False) if none."""
+    text = re.sub(r"(\d)\s+([KMGTP]i?B|[KMGTP]|bytes?)\b", r"\1\2", text or "", flags=re.I)
+    for tok in text.split():
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGTP]?)(i?B|bytes?)?", tok, re.I)
+        if not m:
+            continue
+        num, unit, suffix = float(m.group(1)), m.group(2).upper(), m.group(3)
+        if unit:
+            return int(num * _UNIT[unit]), False
+        if suffix:
+            return int(num), True
+        if tok.isdigit():
+            last = tok == text.split()[-1] and re.search(r"\d:\d\d", text)
+            if (len(tok) >= 4 and not 1970 <= int(tok) <= 2100) or last:
+                return int(tok), True   # plain byte count (nginx style)
+    return -1, False
+
+
+def normalize_dir_url(text):
+    """Tidy up what the user typed into a proper http(s) directory address, or None."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = "https://" + text
+    p = urllib.parse.urlparse(text)
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return None
+    path = p.path or "/"
+    if not path.endswith("/"):
+        last = path.rsplit("/", 1)[-1]
+        path = path.rsplit("/", 1)[0] + "/" if "." in last else path + "/"
+    return urllib.parse.urlunparse((p.scheme, p.netloc, path, "", "", ""))
+
+
+def folder_name_for_url(url):
+    p = urllib.parse.urlparse(url)
+    name = urllib.parse.unquote((p.netloc + p.path).strip("/")).replace("/", "_")
+    return re.sub(r"[^\w.\- ]", "_", name) or "open_directory"
+
+
+def fetch_text(url):
+    with open_url(url) as resp:
+        raw = resp.read(20 * 1024 * 1024)
+        charset = resp.headers.get_content_charset() or "utf-8"
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def crawl_open_directory(start_url, recurse, want_sizes, report, cancelled):
+    """Walk an open-directory website and return (files, note)."""
+    start = urllib.parse.urlparse(start_url)
+    host, base_path = start.netloc.lower(), start.path
+    todo, visited = deque([start_url]), set()
+    files = {}              # url -> file dict
+    problems = 0
+    pages = 0
+
+    while todo and not cancelled():
+        page = todo.popleft()
+        page_key = page.split("#")[0].split("?")[0]
+        if page_key in visited:
+            continue
+        visited.add(page_key)
+        pages += 1
+        report(f"Scanning... {pages} folder(s) checked, {len(files)} file(s) found")
+        try:
+            body = fetch_text(page)
+        except Exception:
+            if pages == 1:
+                raise
+            problems += 1
+            continue
+        parser = _LinkParser()
+        parser.feed(body)
+        page_path = urllib.parse.urlparse(page).path
+
+        for href, trailing in parser.finish():
+            href = href.strip()
+            if not href or href[0] in "?#":
+                continue                      # sort links, anchors
+            full = urllib.parse.urljoin(page, href).split("#")[0]
+            u = urllib.parse.urlparse(full)
+            if u.scheme not in ("http", "https") or u.netloc.lower() != host:
+                continue                      # mailto:, other websites
+            if not u.path.startswith(base_path):
+                continue                      # "Parent Directory" and anything outside the chosen folder
+            if u.path.endswith("/"):
+                if u.query or not recurse:
+                    continue
+                key = u._replace(query="", fragment="").geturl()
+                if key not in visited:
+                    todo.append(key)
+                continue
+            if u.path == page_path or full in files:
+                continue
+            name = urllib.parse.unquote(u.path[len(base_path):])
+            if not name:
+                continue
+            ext = name.rsplit(".", 1)[-1].upper() if "." in name.rsplit("/", 1)[-1] else ""
+            size, exact = parse_listing_size(trailing)
+            files[full] = {"name": name, "size": size, "exact": exact, "source": ext, "url": full}
+
+    result = list(files.values())
+    note = []
+    if want_sizes and not cancelled():
+        missing = [f for f in result if f["size"] < 0 or not f["exact"]]
+        done = [0]
+
+        def head(f):
+            if cancelled():
+                return
+            try:
+                with open_url(f["url"], timeout=15, method="HEAD") as resp:
+                    length = resp.headers.get("Content-Length")
+                    if length and length.isdigit():
+                        f["size"] = int(length)
+                        f["exact"] = True
+            except Exception:
+                pass
+            done[0] += 1
+            if done[0] % 5 == 0:
+                report(f"Looking up file sizes... {done[0]} of {len(missing)}")
+
+        if missing:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(head, missing))
+    if cancelled():
+        note.append("scan stopped early - showing what was found so far")
+    if problems:
+        note.append(f"{problems} folder(s) could not be read")
+    return result, "; ".join(note)
+
+
+# --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1250x800")
-        self.minsize(1000, 600)
+        self.geometry("1250x860")
+        self.minsize(1000, 650)
 
         self.config_data = load_config()
         self.dark = bool(self.config_data.get("dark_mode", False))
         self.pal = PALETTES["dark" if self.dark else "light"]
         self.tk_widgets = []     # plain tk widgets that need recolouring: (widget, kind)
-        self.filter_popup = None
+        self.panels = []
+        self.downloading = False
+        self.downloader_window = None
+        self.protocol("WM_DELETE_WINDOW", self.on_quit)
 
         self.set_window_icon()
         self.setup_fonts()
 
-        self.identifier = None
-        self.items = {}          # file iid -> {"name","size","checked","source","format"}
-        self.folders = {}        # folder iid -> {"path","files":[file iids],"size"}
-        self.save_dir_custom = False
-        self.loading = False
-
-        self.url_var = tk.StringVar()
-        self.dir_var = tk.StringVar()
-        self.custom_ext_var = tk.StringVar()
-        self.select_all_var = tk.BooleanVar(value=True)
         self.dark_var = tk.BooleanVar(value=self.dark)
-        self.ext_vars = {e: tk.BooleanVar(value=False) for e in FILTER_EXTENSIONS}
-        self.status_var = tk.StringVar(value="Paste an archive.org URL and click Load.")
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self.archive_panel = ArchivePanel(self.nb, self)
+        self.dir_panel = OpenDirPanel(self.nb, self)
+        self.nb.add(self.archive_panel, text="Internet Archive")
+        self.nb.add(self.dir_panel, text="Open Directory")
+        self.panels = [self.archive_panel, self.dir_panel]
 
-        self.build_ui()
+        # Dark mode switch sits at the right end of the tab strip.
+        dark_chk = BigCheck(self, self, "Dark mode", self.dark_var, self.toggle_dark)
+        dark_chk.place(in_=self.nb, relx=1.0, x=-12, y=8, anchor="ne")
+        dark_chk.lift()
         self.apply_theme()
+        self.update_idletasks()
+        need_h = self.winfo_reqheight()
+        self.minsize(1000, need_h)
+        self.geometry(f"1250x{max(860, need_h + 20)}")
+
+    def on_quit(self):
+        if self.downloading and self.downloader_window is not None:
+            if not messagebox.askyesno(APP_TITLE, "A download is still running.\n\nCancel it and quit?"):
+                return
+            try:
+                self.downloader_window.downloader.cancel()
+            except Exception:
+                pass
+        self.destroy()
 
     # ---- Setup --------------------------------------------------------
     def register_tk(self, widget, kind):
@@ -645,8 +892,17 @@ class App(tk.Tk):
                background=[("selected", P["select_bg"])],
                foreground=[("selected", P["select_fg"])])
 
-        self.tree.tag_configure("even", background=P["row_even"], foreground=P["fg"])
-        self.tree.tag_configure("odd", background=P["row_odd"], foreground=P["fg"])
+        st.configure("TNotebook", background=P["bg"], bordercolor=P["popup_border"],
+                     lightcolor=P["bg"], darkcolor=P["bg"], tabmargins=(2, 4, 2, 0))
+        st.configure("TNotebook.Tab", background=P["button"], foreground=P["fg"],
+                     padding=(26, 10), font=(family, size, "bold"), bordercolor=P["popup_border"],
+                     lightcolor=P["button"], darkcolor=P["button"])
+        st.map("TNotebook.Tab",
+               background=[("selected", P["accent"]), ("active", P["button_active"])],
+               foreground=[("selected", "#ffffff")])
+        for panel in self.panels:
+            panel.tree.tag_configure("even", background=P["row_even"], foreground=P["fg"])
+            panel.tree.tag_configure("odd", background=P["row_odd"], foreground=P["fg"])
 
         self.recolor_tk()
         set_titlebar_dark(self, self.dark)
@@ -666,24 +922,57 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
+
+# --------------------------------------------------------------------------
+# One tab: address bar, filters, file list, save folder, download button
+# --------------------------------------------------------------------------
+class SourcePanel(ttk.Frame):
+    SOURCE_LABEL = "URL:"
+    PROMPT = "Paste a link and click Load."
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.filter_popup = None
+        self.source_id = None      # name of what is currently listed
+        self.pending_id = None     # name of what is being loaded
+        self.items = {}            # file iid -> {"name","size","url","checked","source"}
+        self.folders = {}          # folder iid -> {"path","files":[file iids],"size"}
+        self.save_dir_custom = False
+        self.loading = False
+        self.job_q = None
+        self.cancel_flag = threading.Event()
+
+        self.url_var = tk.StringVar()
+        self.dir_var = tk.StringVar()
+        self.custom_ext_var = tk.StringVar()
+        self.select_all_var = tk.BooleanVar(value=True)
+        self.ext_vars = {e: tk.BooleanVar(value=False) for e in FILTER_EXTENSIONS}
+        self.status_var = tk.StringVar(value=self.PROMPT)
+        self.build_ui()
+
     # ---- UI -----------------------------------------------------------
+    def build_extra_row(self):
+        """Subclasses can add options under the address bar."""
+
     def build_ui(self):
-        top = ttk.Frame(self, padding=(10, 10, 10, 4))
+        top = ttk.Frame(self, padding=(10, 14, 10, 4))
         top.pack(fill="x")
-        ttk.Label(top, text="Archive URL:").pack(side="left")
+        ttk.Label(top, text=self.SOURCE_LABEL).pack(side="left")
         entry = ttk.Entry(top, textvariable=self.url_var)
         entry.pack(side="left", fill="x", expand=True, padx=6)
-        entry.bind("<Return>", lambda e: self.load())
-        entry.focus_set()
-        self.load_btn = ttk.Button(top, text="Load", command=self.load)
+        entry.bind("<Return>", lambda e: self.load_or_stop())
+        self.url_entry = entry
+        self.load_btn = ttk.Button(top, text="Load", command=self.load_or_stop)
         self.load_btn.pack(side="left")
-        BigCheck(top, self, "Dark mode", self.dark_var, self.toggle_dark).pack(side="left", padx=(20, 0))
+
+        self.build_extra_row()
 
         # ---- Filter row ----
         frow = ttk.Frame(self, padding=(10, 4))
         frow.pack(fill="x")
         ttk.Label(frow, text="Select by type:").pack(side="left")
-        self.type_btn = ttk.Button(frow, text="File types ▾", command=self.toggle_filter_popup)
+        self.type_btn = ttk.Button(frow, text="File types \u25be", command=self.toggle_filter_popup)
         self.type_btn.pack(side="left", padx=6)
         ttk.Label(frow, text="Other (e.g. pdf, epub):").pack(side="left", padx=(10, 0))
         ext_entry = ttk.Entry(frow, textvariable=self.custom_ext_var, width=22)
@@ -697,7 +986,7 @@ class App(tk.Tk):
 
         bar = ttk.Frame(mid)
         bar.pack(fill="x", pady=(0, 4))
-        BigCheck(bar, self, "Select all", self.select_all_var, self.toggle_all).pack(side="left")
+        BigCheck(bar, self.app, "Select all", self.select_all_var, self.toggle_all).pack(side="left")
         ttk.Button(bar, text="Expand all", command=lambda: self.set_all_open(True)).pack(side="left", padx=(28, 4))
         ttk.Button(bar, text="Collapse all", command=lambda: self.set_all_open(False)).pack(side="left", padx=4)
         self.count_label = ttk.Label(bar, text="")
@@ -705,7 +994,7 @@ class App(tk.Tk):
 
         cols = ("size", "source")
         # Checkbox pictures, folder nesting and names live in the tree's first column (#0).
-        self.tree = ttk.Treeview(mid, columns=cols, show="tree headings", selectmode="browse")
+        self.tree = ttk.Treeview(mid, columns=cols, show="tree headings", selectmode="browse", height=6)
         self.tree.heading("#0", text="File", anchor="w")
         self.tree.heading("size", text="Size")
         self.tree.heading("source", text="Type")
@@ -733,33 +1022,32 @@ class App(tk.Tk):
         self.dl_btn = ttk.Button(actions, text="Download", command=self.start_download, state="disabled")
         self.dl_btn.pack(side="right")
 
-    # ---- File-type filter ---------------------------------------------
     def toggle_filter_popup(self):
         if self.filter_popup is not None:
             self.close_filter_popup()
             return
-        P = self.pal
-        pop = tk.Toplevel(self)
+        P = self.app.pal
+        pop = tk.Toplevel(self.winfo_toplevel())
         pop.withdraw()
         pop.overrideredirect(True)
-        pop.transient(self)
+        pop.transient(self.winfo_toplevel())
         pop.config(bg=P["popup_border"])
         body = tk.Frame(pop, bd=0, highlightthickness=2)
         body.pack(padx=0, pady=0)
-        self.register_tk(body, "popup")
+        self.app.register_tk(body, "popup")
         self.filter_popup = pop
 
         cols = 2
         for i, ext in enumerate(FILTER_EXTENSIONS):
-            chk = BigCheck(body, self, ext, self.ext_vars[ext], self.on_filter_changed)
+            chk = BigCheck(body, self.app, ext, self.ext_vars[ext], self.on_filter_changed)
             chk.config(bg=P["field"], padx=12, pady=5)
             chk.grid(row=i // cols, column=i % cols, sticky="we", padx=6, pady=1)
-            self.tk_widgets[-1] = (chk, "popup_label")
+            self.app.tk_widgets[-1] = (chk, "popup_label")
         done = ttk.Button(body, text="Done", command=self.close_filter_popup)
         done.grid(row=(len(FILTER_EXTENSIONS) + cols - 1) // cols, column=0, columnspan=cols,
                   sticky="e", padx=10, pady=8)
 
-        self.recolor_tk()
+        self.app.recolor_tk()
         pop.update_idletasks()
         x = self.type_btn.winfo_rootx()
         y = self.type_btn.winfo_rooty() + self.type_btn.winfo_height()
@@ -789,7 +1077,7 @@ class App(tk.Tk):
         pop = self.filter_popup
         self.filter_popup = None
         if pop is not None:
-            self.tk_widgets = [(w, k) for (w, k) in self.tk_widgets if str(w).startswith(str(pop)) is False]
+            self.app.tk_widgets = [(w, k) for (w, k) in self.app.tk_widgets if str(w).startswith(str(pop)) is False]
             try:
                 pop.destroy()
             except tk.TclError:
@@ -809,7 +1097,7 @@ class App(tk.Tk):
         exts = self.active_extensions()
         if not self.items:
             if not quiet:
-                self.status_var.set("Load an archive first.")
+                self.status_var.set("Load a file list first.")
             return
         if not exts:
             if not quiet:
@@ -835,113 +1123,9 @@ class App(tk.Tk):
         if self.items:
             self.status_var.set("Filter cleared - all files selected.")
 
-    # ---- Loading file list -------------------------------------------
-    def load(self):
-        if self.loading:
-            return
-        ident = parse_identifier(self.url_var.get())
-        if not ident:
-            messagebox.showerror(
-                APP_TITLE,
-                "That doesn't look like an archive.org item URL.\n\n"
-                "Example: https://archive.org/details/some-item-name",
-            )
-            return
-        self.loading = True
-        self.load_btn.config(state="disabled")
-        self.dl_btn.config(state="disabled")
-        self.status_var.set(f"Loading '{ident}'...")
-        threading.Thread(target=self._load_worker, args=(ident,), daemon=True).start()
-
-    def _load_worker(self, ident):
-        try:
-            url = f"https://archive.org/metadata/{urllib.parse.quote(ident)}"
-            with open_url(url) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if not data or "files" not in data:
-                raise ValueError("Item not found, or it has no files.")
-            files = []
-            for f in data["files"]:
-                if str(f.get("private", "")).lower() == "true":
-                    continue
-                name = f.get("name")
-                if not name:
-                    continue
-                try:
-                    size = int(f.get("size", -1))
-                except (TypeError, ValueError):
-                    size = -1
-                files.append({
-                    "name": name,
-                    "size": size,
-                    "source": f.get("source", ""),
-                    "format": f.get("format", ""),
-                })
-            self.after(0, self._load_done, ident, files, None)
-        except Exception as exc:
-            self.after(0, self._load_done, ident, None, exc)
-
-    def _load_done(self, ident, files, error):
-        self.loading = False
-        self.load_btn.config(state="normal")
-        if error is not None:
-            self.status_var.set("Load failed.")
-            messagebox.showerror(APP_TITLE, f"Could not load '{ident}':\n\n{error}")
-            return
-
-        self.identifier = ident
-        self.tree.delete(*self.tree.get_children())
-        self.items.clear()
-        self.folders.clear()
-        folder_iids = {}   # "music/disc1" -> tree id
-
-        def sort_key(f):
-            parts = [p for p in f["name"].split("/") if p]
-            # folders before files at every level
-            return tuple((1 if i == len(parts) - 1 else 0, p.lower()) for i, p in enumerate(parts))
-
-        for f in sorted(files, key=sort_key):
-            parts = [p for p in f["name"].split("/") if p]
-            if not parts:
-                continue
-            parent, path, ancestors = "", "", []
-            for part in parts[:-1]:
-                path = f"{path}/{part}" if path else part
-                fid = folder_iids.get(path)
-                if fid is None:
-                    fid = self.tree.insert(
-                        parent, "end", text=f"  {part}/", image=self.row_imgs[("open", "on")],
-                        open=True, values=("", ""),
-                    )
-                    folder_iids[path] = fid
-                    self.folders[fid] = {"path": path, "files": [], "size": 0}
-                ancestors.append(fid)
-                parent = fid
-            iid = self.tree.insert(
-                parent, "end", text="  " + parts[-1], image=self.row_imgs[("file", "on")],
-                values=(human_size(f["size"]), f["source"] or ""),
-            )
-            self.items[iid] = {**f, "checked": True}
-            for fid in ancestors:
-                self.folders[fid]["files"].append(iid)
-                self.folders[fid]["size"] += max(f["size"], 0)
-        for fid, info in self.folders.items():
-            self.tree.set(fid, "size", human_size(info["size"]))
-        self.restripe()
-
-        self.select_all_var.set(True)
-        if not self.save_dir_custom:
-            self.dir_var.set(default_save_dir(ident))
-        self.dl_btn.config(state="normal" if self.items else "disabled")
-        self.status_var.set(f"Loaded {len(self.items)} files from '{ident}'.")
-        self.update_count()
-        if self.active_extensions():
-            self.apply_filter(quiet=True)
-
-    # ---- Checkbox handling -------------------------------------------
     def set_checked(self, iid, value):
         self.items[iid]["checked"] = value
-        self.tree.item(iid, image=self.row_imgs[("file", "on" if value else "off")])
+        self.tree.item(iid, image=self.app.row_imgs[("file", "on" if value else "off")])
 
     def toggle_item(self, iid):
         """Tick/untick a file, or a whole folder (everything inside it)."""
@@ -966,7 +1150,7 @@ class App(tk.Tk):
             states = [self.items[i]["checked"] for i in info["files"]]
             state = "on" if all(states) else ("part" if any(states) else "off")
             kind = "open" if self.is_open(fid) else "closed"
-            self.tree.item(fid, image=self.row_imgs[(kind, state)])
+            self.tree.item(fid, image=self.app.row_imgs[(kind, state)])
 
     def is_open(self, iid):
         return str(self.tree.item(iid, "open")) in ("1", "true", "True")
@@ -993,7 +1177,7 @@ class App(tk.Tk):
         left = event.x
         while left > 0 and "image" in self.tree.identify("element", left - 1, event.y):
             left -= 1
-        if iid in self.folders and event.x - left < self.box + self.gap // 2:
+        if iid in self.folders and event.x - left < self.app.box + self.app.gap // 2:
             self.tree.item(iid, open=not self.is_open(iid))   # the +/- button
             self.on_open_close()
         else:
@@ -1006,7 +1190,6 @@ class App(tk.Tk):
             self.toggle_item(iid)
             return "break"
 
-    # ---- Row shading / expand-collapse --------------------------------
     def restripe(self):
         """Alternate row shading down the rows that are currently visible."""
         counter = [0]
@@ -1040,7 +1223,6 @@ class App(tk.Tk):
         total = sum(max(i["size"], 0) for i in sel)
         self.count_label.config(text=f"{len(sel)} of {len(self.items)} selected ({human_size(total)})")
 
-    # ---- Save folder --------------------------------------------------
     def browse(self):
         start = self.dir_var.get()
         while start and not os.path.isdir(start):
@@ -1050,10 +1232,124 @@ class App(tk.Tk):
             self.dir_var.set(os.path.normpath(chosen))
             self.save_dir_custom = True
 
+    # ---- Loading the file list (runs in the background) --------------
+    def load(self):
+        """Subclasses check the address and call start_job()."""
+        raise NotImplementedError
+
+    def load_or_stop(self):
+        if self.loading:
+            self.cancel_flag.set()
+            self.load_btn.config(state="disabled", text="Stopping...")
+        else:
+            self.load()
+
+    def start_job(self, label, work):
+        """Run work(report, cancelled) -> (files, note) in a thread."""
+        self.job_q = queue.Queue()
+        self.cancel_flag = threading.Event()
+        q, flag = self.job_q, self.cancel_flag
+
+        def runner():
+            try:
+                files, note = work(lambda msg: q.put(("status", msg)), flag.is_set)
+                q.put(("done", files, note, None))
+            except Exception as exc:
+                q.put(("done", None, "", exc))
+
+        self.loading = True
+        self.load_btn.config(text="Stop")
+        self.dl_btn.config(state="disabled")
+        self.status_var.set(label)
+        threading.Thread(target=runner, daemon=True).start()
+        self.after(100, self.poll_job)
+
+    def poll_job(self):
+        try:
+            while True:
+                ev = self.job_q.get_nowait()
+                if ev[0] == "status":
+                    self.status_var.set(ev[1])
+                else:
+                    self.finish_job(ev[1], ev[2], ev[3])
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self.poll_job)
+
+    def finish_job(self, files, note, error):
+        self.loading = False
+        self.load_btn.config(text="Load", state="normal")
+        if error is not None:
+            self.status_var.set("Load failed.")
+            self.dl_btn.config(state="normal" if self.items else "disabled")
+            messagebox.showerror(APP_TITLE, f"Could not load '{self.pending_id}':\n\n{error}")
+            return
+        self.show_files(files, note)
+
+    def show_files(self, files, note=""):
+        self.source_id = self.pending_id
+        self.tree.delete(*self.tree.get_children())
+        self.items.clear()
+        self.folders.clear()
+        folder_iids = {}   # "music/disc1" -> tree id
+
+        def sort_key(f):
+            parts = [p for p in f["name"].split("/") if p]
+            # folders before files at every level
+            return tuple((1 if i == len(parts) - 1 else 0, p.lower()) for i, p in enumerate(parts))
+
+        for f in sorted(files, key=sort_key):
+            parts = [p for p in f["name"].split("/") if p]
+            if not parts:
+                continue
+            parent, path, ancestors = "", "", []
+            for part in parts[:-1]:
+                path = f"{path}/{part}" if path else part
+                fid = folder_iids.get(path)
+                if fid is None:
+                    fid = self.tree.insert(
+                        parent, "end", text=f"  {part}/", image=self.app.row_imgs[("open", "on")],
+                        open=True, values=("", ""),
+                    )
+                    folder_iids[path] = fid
+                    self.folders[fid] = {"path": path, "files": [], "size": 0}
+                ancestors.append(fid)
+                parent = fid
+            iid = self.tree.insert(
+                parent, "end", text="  " + parts[-1], image=self.app.row_imgs[("file", "on")],
+                values=(("~" if f["size"] >= 0 and not f.get("exact", True) else "") + human_size(f["size"]),
+                        f["source"] or ""),
+            )
+            self.items[iid] = {**f, "checked": True}
+            for fid in ancestors:
+                self.folders[fid]["files"].append(iid)
+                self.folders[fid]["size"] += max(f["size"], 0)
+        for fid, info in self.folders.items():
+            self.tree.set(fid, "size", human_size(info["size"]))
+        self.restripe()
+
+        self.select_all_var.set(True)
+        if not self.save_dir_custom:
+            self.dir_var.set(default_save_dir(self.source_id))
+        self.dl_btn.config(state="normal" if self.items else "disabled")
+        msg = f"Loaded {len(self.items)} files from '{self.source_id}'."
+        if not self.items:
+            msg = "No files found there."
+        if note:
+            msg += f" ({note})"
+        self.status_var.set(msg)
+        self.update_count()
+        if self.active_extensions():
+            self.apply_filter(quiet=True)
+
     # ---- Download -----------------------------------------------------
     def start_download(self):
+        if self.app.downloading:
+            messagebox.showinfo(APP_TITLE, "A download is already running. Wait for it to finish or cancel it first.")
+            return
         selected = [
-            {"name": i["name"], "size": i["size"]}
+            {"name": i["name"], "size": i["size"], "url": i["url"], "exact": i.get("exact", True)}
             for i in self.items.values() if i["checked"]
         ]
         if not selected:
@@ -1070,15 +1366,66 @@ class App(tk.Tk):
             return
 
         events = queue.Queue()
-        worker = Downloader(self.identifier, selected, dest, events)
+        worker = Downloader(selected, dest, events)
         self.dl_btn.config(state="disabled")
         self.load_btn.config(state="disabled")
-        ProgressWindow(self, self, worker, events, self.download_closed)
+        ProgressWindow(self.winfo_toplevel(), self.app, worker, events, self.download_closed)
         worker.start()
 
     def download_closed(self):
-        self.dl_btn.config(state="normal")
+        self.dl_btn.config(state="normal" if self.items else "disabled")
         self.load_btn.config(state="normal")
+
+
+class ArchivePanel(SourcePanel):
+    SOURCE_LABEL = "Archive URL:"
+    PROMPT = "Paste an archive.org URL and click Load."
+
+    def build_ui(self):
+        super().build_ui()
+        self.url_entry.focus_set()
+
+    def load(self):
+        ident = parse_identifier(self.url_var.get())
+        if not ident:
+            messagebox.showerror(
+                APP_TITLE,
+                "That doesn't look like an archive.org item URL.\n\n"
+                "Example: https://archive.org/details/some-item-name",
+            )
+            return
+        self.pending_id = ident
+        self.start_job(f"Loading '{ident}'...", lambda report, cancelled: (fetch_archive_files(ident), ""))
+
+
+class OpenDirPanel(SourcePanel):
+    SOURCE_LABEL = "Directory URL:"
+    PROMPT = "Paste the address of an open directory (an 'Index of /...' page) and click Load."
+
+    def build_extra_row(self):
+        self.recurse_var = tk.BooleanVar(value=True)
+        self.sizes_var = tk.BooleanVar(value=False)
+        row = ttk.Frame(self, padding=(10, 4))
+        row.pack(fill="x")
+        BigCheck(row, self.app, "Include subfolders", self.recurse_var).pack(side="left")
+        BigCheck(row, self.app, "Look up missing file sizes (slower)", self.sizes_var).pack(side="left", padx=(30, 0))
+
+    def load(self):
+        url = normalize_dir_url(self.url_var.get())
+        if not url:
+            messagebox.showerror(
+                APP_TITLE,
+                "That doesn't look like a web address.\n\n"
+                "Example: https://example.com/files/music/",
+            )
+            return
+        self.url_var.set(url)
+        self.pending_id = folder_name_for_url(url)
+        recurse, sizes = self.recurse_var.get(), self.sizes_var.get()
+        self.start_job(
+            "Scanning...",
+            lambda report, cancelled: crawl_open_directory(url, recurse, sizes, report, cancelled),
+        )
 
 
 if __name__ == "__main__":
