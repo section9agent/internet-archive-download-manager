@@ -26,6 +26,28 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk tk-dev
 
+      # Put the release version and this repository's name into the app, so the built
+      # program knows its own version and where to look for updates.
+      - name: Stamp version and repository
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          VER=""
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then VER="$GITHUB_REF_NAME"; elif [ -n "$INPUT_TAG" ]; then VER="$INPUT_TAG"; fi
+          export STAMP_VERSION="${VER#v}"
+          python - <<'PY'
+          import os, re
+          p = "archive_downloader.py"
+          s = open(p, encoding="utf-8").read()
+          ver = os.environ.get("STAMP_VERSION", "")
+          if ver:
+              s = re.sub(r'(?m)^VERSION = ".*"$', 'VERSION = "%s"' % ver, s)
+          s = re.sub(r'(?m)^GITHUB_REPO = ".*"$', 'GITHUB_REPO = "%s"' % os.environ["GITHUB_REPOSITORY"], s)
+          open(p, "w", encoding="utf-8").write(s)
+          PY
+          grep -n '^VERSION\|^GITHUB_REPO' archive_downloader.py
+
       - run: pip install pyinstaller pillow
       - name: Syntax check
         run: python -m py_compile archive_downloader.py
