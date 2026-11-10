@@ -1,10 +1,10 @@
-name: Build apps
+name: Build apps Main
 on:
   push: { tags: ["v*"] }
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag for the draft (e.g. v1.0.0). Leave empty for a build-number tag."
+        description: "Release tag for the draft (e.g. v1.1.0). Leave empty for a build-number tag."
         required: false
         default: ""
 jobs:
