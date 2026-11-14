@@ -59,7 +59,10 @@ jobs:
 
       - name: Show the end of the build log
         if: failure()
-        run: tail -n 120 build.log
+        run: |
+          grep -v "^#     " build.log | tail -n 150
+          echo "=== lines mentioning errors ==="
+          grep -nE "error:|Error|ERROR|FAILED|failed|No matching|not found|Could not" build.log | grep -v "^[0-9]*:#" | tail -n 40
 
       - name: Keep the full build log
         if: failure()
