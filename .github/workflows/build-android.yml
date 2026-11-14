@@ -48,7 +48,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf automake libtool libltdl-dev build-essential pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
-          pip install --upgrade pip setuptools wheel "cython>=3.0.10" virtualenv buildozer
+          pip install --upgrade pip setuptools wheel "cython>=3.0.10,<3.1" virtualenv buildozer
 
       - name: Build APK
         working-directory: android
