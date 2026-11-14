@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import threading
 import webbrowser
 
@@ -620,6 +621,8 @@ KV = r"""
     BoxLayout:
         id: body
 """
+# Every size in the layout is multiplied by app.u: 1.0 on tablets, smaller on phones.
+KV = re.sub(r"dp\(([0-9.]+)\)", r"(dp(\1) * app.u)", KV)
 
 
 class Panel(BoxLayout):
@@ -679,7 +682,7 @@ class Panel(BoxLayout):
                                  "Example: https://archive.org/details/some-item-name")
                 return
             self.pending_id = ident
-            self.start_job(f"Loading '{ident}'...", lambda report, cancelled: (core.fetch_archive_files(ident), ""))
+            self.start_job(f"Loading '{ident}'...", lambda report, cancelled: core.fetch_archive_files_note(ident))
         else:
             url = core.normalize_dir_url(self.url_text)
             if not url:
@@ -1072,6 +1075,8 @@ class IADMApp(App):
     icon = "icon.png"
     dark = BooleanProperty(False)
     fs = NumericProperty(18)
+    u = NumericProperty(1.0)     # layout scale: 1.0 tablet, smaller on phones
+    phone = BooleanProperty(False)
     theme_rev = NumericProperty(0)
     bg = ListProperty()
     fg = ListProperty()
@@ -1086,7 +1091,8 @@ class IADMApp(App):
     def build(self):
         self.downloading = False
         self.popups = []
-        self.fs = sp(17)
+        self.update_scale()
+        Window.bind(size=lambda *a: self.update_scale())
         self.cfg = self.load_config()
         self.dark = bool(self.cfg.get("dark_mode", False))
         self.auto_update = bool(self.cfg.get("auto_update", True))
@@ -1101,6 +1107,13 @@ class IADMApp(App):
         if core.GITHUB_REPO and self.auto_update:
             Clock.schedule_once(lambda dt: self.check_updates(False), 3)
         return root
+
+    def update_scale(self):
+        """Phones (shortest side under 600 dp) get smaller text and controls; tablets keep the big ones."""
+        short_dp = min(Window.width, Window.height) / dp(1)
+        self.phone = short_dp < 600
+        self.u = 0.72 if self.phone else 1.0
+        self.fs = sp(13) if self.phone else sp(17)
 
     def on_pause(self):
         return True     # keep running (and downloading) when the user switches apps
