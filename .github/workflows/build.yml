@@ -1,10 +1,10 @@
-name: Build apps Main
+name: Build apps
 on:
   push: { tags: ["v*"] }
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag for the draft (e.g. v1.1.0). Leave empty for a build-number tag."
+        description: "Release tag for the draft (e.g. v1.0.0). Leave empty for a build-number tag."
         required: false
         default: ""
 jobs:
@@ -38,7 +38,7 @@ jobs:
           export STAMP_VERSION="${VER#v}"
           python - <<'PY'
           import os, re
-          p = "archive_downloader.py"
+          p = "iadm_core.py"
           s = open(p, encoding="utf-8").read()
           ver = os.environ.get("STAMP_VERSION", "")
           if ver:
@@ -46,11 +46,11 @@ jobs:
           s = re.sub(r'(?m)^GITHUB_REPO = ".*"$', 'GITHUB_REPO = "%s"' % os.environ["GITHUB_REPOSITORY"], s)
           open(p, "w", encoding="utf-8").write(s)
           PY
-          grep -n '^VERSION\|^GITHUB_REPO' archive_downloader.py
+          grep -n '^VERSION\|^GITHUB_REPO' iadm_core.py
 
       - run: pip install pyinstaller pillow
       - name: Syntax check
-        run: python -m py_compile archive_downloader.py
+        run: python -m py_compile archive_downloader.py iadm_core.py
 
       # Make icon.ico (Windows) and icon.icns (macOS) from icon.png
       - run: python make_icons.py

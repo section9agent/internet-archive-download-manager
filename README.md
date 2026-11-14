@@ -51,7 +51,7 @@ No other packages are required.
 
 ## Building the app yourself
 
-**On Windows:** put these files in one folder: `archive_downloader.py`, `icon.png`, `make_icons.py` and `build_exe.bat`. Double-click `build_exe.bat`. The result is `dist\InternetArchiveDownloadManager.exe`.
+**On Windows:** put these files in one folder: `archive_downloader.py`, `iadm_core.py`, `icon.png`, `make_icons.py` and `build_exe.bat`. Double-click `build_exe.bat`. The result is `dist\InternetArchiveDownloadManager.exe`.
 
 **With GitHub Actions (Windows, macOS and Linux):**
 
@@ -61,15 +61,33 @@ No other packages are required.
 
 The workflow stamps the release version (from the tag, e.g. `v1.2.0` becomes `1.2.0`) and your repository name into the app, so it knows what version it is and where to look for updates. The update check only sees **published** releases: open the draft the workflow creates and click *Publish release*. Each new tag must be higher than the last one.
 
-If you build by hand instead of with the workflow, set `GITHUB_REPO = "your-name/your-repo"` (and bump `VERSION`) near the top of `archive_downloader.py`; with `GITHUB_REPO` empty, update checks are switched off.
+If you build by hand instead of with the workflow, set `GITHUB_REPO = "your-name/your-repo"` (and bump `VERSION`) near the top of `iadm_core.py`; with `GITHUB_REPO` empty, update checks are switched off.
 
 The workflow builds with PyInstaller. `make_icons.py` converts `icon.png` into the `.ico` and `.icns` files used for the program icon.
+
+## Android (phones and tablets)
+
+`android/main.py` is a touch version of the app with the same two tabs, folder tree, file-type filters, dark mode, About window and progress window. It uses the same engine (`iadm_core.py`) as the desktop app and adapts to phone and tablet screens, portrait or landscape.
+
+- Needs **Android 10 or newer**. Files are saved into your public **Downloads** folder, inside a folder named after the item, keeping the sub-folders. No storage permission is needed.
+- Keeps the screen awake while downloading. If you leave the app, downloading may pause when Android freezes it; keep it open for big jobs. Partly downloaded files are not resumed; they restart.
+- Updates: the app checks your GitHub releases and, if a newer APK exists, opens it in your browser to install. (Android doesn't allow silent self-updates.)
+
+**Building the APK:** put `iadm_core.py`, `icon.png` and the `android` folder in your repo with `build-android.yml` in `.github/workflows/`, then run *Build Android APK* from the Actions tab (or push a tag such as `v1.0.0`). It produces `InternetArchiveDownloadManager-Android.apk` and attaches it to a draft release. The first build takes a long time (20-40 minutes).
+
+**Installing:** download the APK on your device, open it, and allow installs from your browser when asked.
+
+Note: the Android app was tested on a desktop with the same UI code, but not yet on a physical device.
 
 ## Files in this project
 
 | File                  | Purpose                                              |
 |-----------------------|------------------------------------------------------|
-| `archive_downloader.py` | The application                                    |
+| `archive_downloader.py` | Desktop app (tkinter)                              |
+| `iadm_core.py`        | Shared engine: listing, crawler, downloader, updates |
+| `android/main.py`     | Android app (Kivy) for phones and tablets            |
+| `android/buildozer.spec` | Android build settings                            |
+| `.github/workflows/build-android.yml` | Builds the Android APK               |
 | `icon.png`            | App icon (also used for the window icon)             |
 | `make_icons.py`       | Makes `icon.ico` / `icon.icns` from `icon.png`       |
 | `build_exe.bat`       | One-click Windows build                              |

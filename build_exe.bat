@@ -1,10 +1,8 @@
-Content is user-generated and unverified.
-Learn about artifacts
 @echo off
 REM Builds InternetArchiveDownloadManager.exe (standalone, no Python needed to run it).
 REM Run this ONCE on a Windows PC that has Python installed.
-REM Keep this file next to archive_downloader.py, icon.png and make_icons.py.
-REM For automatic updates, set GITHUB_REPO (and VERSION) near the top of archive_downloader.py first.
+REM Keep this file next to archive_downloader.py, iadm_core.py, icon.png and make_icons.py.
+REM For automatic updates, set GITHUB_REPO (and VERSION) near the top of iadm_core.py first.
 
 setlocal
 cd /d "%~dp0"

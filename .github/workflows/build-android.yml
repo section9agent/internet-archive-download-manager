@@ -1,0 +1,80 @@
+name: Build Android APK
+on:
+  push: { tags: ["v*"] }
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag for the draft (e.g. v1.0.1). Leave empty for a build-number tag."
+        required: false
+        default: ""
+jobs:
+  apk:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Work out version
+        id: ver
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}";
+          elif [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG";
+          else TAG="build-${GITHUB_RUN_NUMBER}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          V="${TAG#v}"
+          if ! echo "$V" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then V="1.0.0"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp version and repository
+        shell: bash
+        run: |
+          sed -i -E "s/^VERSION = .*/VERSION = \"${{ steps.ver.outputs.version }}\"/" iadm_core.py
+          sed -i -E "s|^GITHUB_REPO = .*|GITHUB_REPO = \"${{ github.repository }}\"|" iadm_core.py
+          sed -i -E "s/^version = .*/version = ${{ steps.ver.outputs.version }}/" android/buildozer.spec
+          grep -nE '^(VERSION|GITHUB_REPO) =' iadm_core.py
+
+      - name: Gather sources
+        run: |
+          cp iadm_core.py icon.png android/
+          python -m py_compile android/main.py android/iadm_core.py
+
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+          pip install --upgrade pip "cython<3" buildozer
+
+      - name: Build APK
+        working-directory: android
+        run: buildozer -v android debug
+
+      - name: Name the APK
+        run: |
+          mkdir -p out
+          cp android/bin/*.apk out/InternetArchiveDownloadManager-Android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InternetArchiveDownloadManager-Android
+          path: out/*
+
+      - name: Create draft release (or add to it)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" out/* --repo "$REPO" --draft --target "${GITHUB_SHA}" \
+              --title "Internet Archive Download Manager ${TAG}" \
+              --notes "Android APK (phones and tablets, Android 10+). Open the file on your device to install; you may need to allow installs from your browser."
+          fi
