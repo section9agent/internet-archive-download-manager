@@ -13,6 +13,7 @@ import html.parser
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -133,11 +134,45 @@ def safe_folder_name(text):
     return re.sub(r'[<>:"/\\|?*]', "_", text or "").strip() or "download"
 
 
+_SSL_CTX = None
+
+
+def ssl_context():
+    """HTTPS settings. On Android, Python can't find the phone's certificates by itself,
+    so trust both the phone's own certificate store and the certifi bundle."""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        ctx = ssl.create_default_context()
+        if "ANDROID_ARGUMENT" in os.environ or "ANDROID_ROOT" in os.environ:
+            for capath in ("/system/etc/security/cacerts", "/apex/com.android.conscrypt/cacerts"):
+                if os.path.isdir(capath):
+                    try:
+                        ctx.load_verify_locations(capath=capath)
+                    except Exception:
+                        pass
+                    # OpenSSL loads hashed-name files lazily; also read them in directly.
+                    try:
+                        for fn in os.listdir(capath):
+                            try:
+                                ctx.load_verify_locations(cafile=os.path.join(capath, fn))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            try:
+                import certifi
+                ctx.load_verify_locations(cafile=certifi.where())
+            except Exception:
+                pass
+        _SSL_CTX = ctx
+    return _SSL_CTX
+
+
 def open_url(url, headers=None, timeout=30, method=None):
     req = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, **(headers or {})}, method=method
     )
-    return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
 
 
 def version_tuple(text):
