@@ -59,7 +59,8 @@ jobs:
           set -o pipefail
           export PATH="$JAVA_HOME/bin:$PATH"
           java -version
-          yes | buildozer -v android debug 2>&1 | tee ../build.log
+          buildozer -v android debug 2>&1 | tee ../build.log
+          ls -la bin
 
       - name: Show the end of the build log
         if: failure()
