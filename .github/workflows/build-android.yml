@@ -53,16 +53,23 @@ jobs:
       - name: Build APK
         working-directory: android
         shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/temurin-17-jdk-amd64
         run: |
           set -o pipefail
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
           yes | buildozer -v android debug 2>&1 | tee ../build.log
 
       - name: Show the end of the build log
         if: failure()
         run: |
-          grep -v "^#     " build.log | tail -n 150
-          echo "=== lines mentioning errors ==="
-          grep -nE "error:|Error|ERROR|FAILED|failed|No matching|not found|Could not" build.log | grep -v "^[0-9]*:#" | tail -n 40
+          echo "=== Gradle failure details ==="
+          grep -n -m1 "FAILURE: Build failed" build.log
+          grep -A40 -m1 "FAILURE: Build failed" build.log | cut -c1-400
+          echo "=== lines before it ==="
+          L=$(grep -n -m1 "FAILURE: Build failed" build.log | cut -d: -f1)
+          if [ -n "$L" ]; then sed -n "$((L-40)),$((L-1))p" build.log | cut -c1-300; fi
 
       - name: Keep the full build log
         if: failure()
