@@ -210,14 +210,20 @@ def fetch_latest_release(repo, asset_name):
 # --------------------------------------------------------------------------
 def fetch_archive_files(ident):
     """File list of an archive.org item, from its metadata."""
+    return fetch_archive_files_note(ident)[0]
+
+
+def fetch_archive_files_note(ident):
+    """(file list, short note). The note says when archive.org itself lists fewer files than expected."""
     url = f"https://archive.org/metadata/{urllib.parse.quote(ident)}"
     with open_url(url) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     if not data or "files" not in data:
         raise ValueError("Item not found, or it has no files.")
-    files = []
+    files, hidden = [], 0
     for f in data["files"]:
         if str(f.get("private", "")).lower() == "true":
+            hidden += 1
             continue
         name = f.get("name")
         if not name:
@@ -232,7 +238,56 @@ def fetch_archive_files(ident):
             "source": f.get("source", ""),
             "url": f"https://archive.org/download/{urllib.parse.quote(ident)}/{urllib.parse.quote(name)}",
         })
-    return files
+    notes = []
+    # The metadata can leave files out (a big item may list only its housekeeping files),
+    # so also read the item's download page - the same list you see in a browser.
+    try:
+        have = {f["name"] for f in files}
+        added = 0
+        base = f"https://archive.org/download/{urllib.parse.quote(ident)}/"
+        parser = _LinkParser()
+        parser.feed(fetch_text(base))
+        for href, trailing in parser.finish():
+            href = href.strip()
+            if not href or href[0] in "?#" or href.startswith(("..", "/")) and not href.startswith(
+                    f"/download/{urllib.parse.quote(ident)}/"):
+                continue
+            u = urllib.parse.urlparse(urllib.parse.urljoin(base, href))
+            if u.netloc.lower() != "archive.org" or u.query:
+                continue
+            if u.path.endswith("/"):
+                # "View Contents" link: the size column comes after it, so use it for the file before.
+                prev = urllib.parse.unquote(u.path[len(urllib.parse.urlparse(base).path):]).rstrip("/")
+                for f in files:
+                    if f["name"] == prev and f["size"] < 0:
+                        f["size"], f["exact"] = parse_listing_size(trailing)
+                continue          # folders and "View Contents" links are not files
+            prefix = urllib.parse.urlparse(base).path
+            if not u.path.startswith(prefix):
+                continue
+            name = urllib.parse.unquote(u.path[len(prefix):])
+            if not name or name in have:
+                continue
+            size, exact = parse_listing_size(trailing)
+            files.append({"name": name, "size": size, "exact": exact, "source": "",
+                          "url": urllib.parse.urlunparse(u._replace(fragment=""))})
+            have.add(name)
+            added += 1
+        if added:
+            notes.append(f"{added} file(s) taken from the download page")
+    except Exception:
+        pass
+    if hidden:
+        notes.append(f"{hidden} restricted file(s) not shown")
+    try:
+        expected = int(data.get("files_count", 0))
+    except (TypeError, ValueError):
+        expected = 0
+    if expected > len(files) + hidden:
+        notes.append(f"archive.org says the item has {expected} files")
+    if data.get("is_dark"):
+        notes.append("this item is disabled/restricted on archive.org")
+    return files, "; ".join(notes)
 
 
 class _LinkParser(html.parser.HTMLParser):
