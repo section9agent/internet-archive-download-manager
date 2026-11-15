@@ -749,6 +749,8 @@ class Panel(BoxLayout):
         if self.active_extensions():
             self.apply_filter(quiet=True)
         self.refresh()
+        if note and self.kind == "archive":
+            self.app.message("Loaded", f"{len(self.file_nodes)} files.\n\n{note}\n\n(App version {core.VERSION})")
 
     # ---- list ---------------------------------------------------------------
     def refresh(self):

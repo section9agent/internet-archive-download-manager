@@ -273,10 +273,9 @@ def fetch_archive_files_note(ident):
                           "url": urllib.parse.urlunparse(u._replace(fragment=""))})
             have.add(name)
             added += 1
-        if added:
-            notes.append(f"{added} file(s) taken from the download page")
-    except Exception:
-        pass
+        notes.append(f"metadata listed {len(files) - added} file(s); the download page added {added}")
+    except Exception as exc:
+        notes.append(f"couldn't read the download page ({type(exc).__name__}: {exc})")
     if hidden:
         notes.append(f"{hidden} restricted file(s) not shown")
     try:
