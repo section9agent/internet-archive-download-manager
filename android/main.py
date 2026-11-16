@@ -875,8 +875,34 @@ class ServiceLink:
         self.seen_file = None
         self.last_bytes = None
         self.done = False
+        self.folder = ""
+        self.inproc = None       # set if the background service wouldn't start and we download here instead
         self.stale_since = time.time()
         Clock.schedule_interval(self.poll, 0.3)
+
+    def run_in_app(self, reason):
+        """Background service didn't respond: stop it from starting late, and download inside the app."""
+        for p in (jf.JOB,):
+            jf.remove(p)
+        try:
+            with open(jf.CANCEL, "w") as fh:
+                fh.write("1")
+        except OSError:
+            pass
+        try:
+            from mediastore import MediaStoreStore
+            self.inproc = core.Downloader(self.files, "Downloads/" + core.safe_folder_name(self.folder),
+                                          self.events, store=MediaStoreStore(self.folder))
+            self.inproc.start()
+            set_keep_screen_on(True)
+        except Exception as exc:
+            self.finish([0, 0, [["download", f"{reason}\n{exc}"]], False])
+            return
+        app = App.get_running_app()
+        if app is not None:
+            app.message("Background downloading unavailable",
+                        "The background download service didn't start, so this download is running inside "
+                        "the app instead. Keep the app open until it finishes.\n\n" + reason)
 
     @classmethod
     def launch(cls, files, folder):
@@ -893,6 +919,7 @@ class ServiceLink:
         AndroidService("Downloading files", "Internet Archive Download Manager").start("go")
         link = cls(files)
         link.token = token
+        link.folder = folder
         return link
 
     @classmethod
@@ -909,6 +936,9 @@ class ServiceLink:
         return link
 
     def cancel(self):
+        if self.inproc is not None:
+            self.inproc.cancel()
+            return
         try:
             with open(jf.CANCEL, "w") as fh:
                 fh.write("1")
@@ -918,10 +948,19 @@ class ServiceLink:
     def poll(self, dt):
         if self.done:
             return False
+        if self.inproc is not None:
+            return False        # the in-app downloader reports through self.events itself
         st = jf.read_json(jf.STATUS)
         if st is None or st.get("token") != self.token:
-            if time.time() - self.stale_since > 40:
-                self.finish([0, 0, [["download", "The download service didn't start."]], False])
+            if time.time() - self.stale_since > 15:
+                reason = "No response from the service."
+                err = os.path.join(jf.PRIV, "iadm_service_error.txt")
+                try:
+                    with open(err, "r") as fh:
+                        reason = "Service error:\n" + fh.read()[-600:]
+                except OSError:
+                    pass
+                self.run_in_app(reason)
                 return False
             return True
         self.stale_since = time.time()

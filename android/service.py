@@ -8,8 +8,18 @@ import queue
 import time
 import traceback
 
-import iadm_core as core
-import jobfiles as jf
+try:
+    import iadm_core as core
+    import jobfiles as jf
+except BaseException:
+    for _d in (os.environ.get("ANDROID_PRIVATE"), os.getcwd()):
+        try:
+            with open(os.path.join(_d, "iadm_service_error.txt"), "w") as _fh:
+                _fh.write(traceback.format_exc())
+            break
+        except Exception:
+            continue
+    raise
 
 
 def write_status(state):
@@ -23,7 +33,8 @@ def write_status(state):
 def main():
     job = jf.read_json(jf.JOB)
     token = job.get("token") if job else None
-    state = {"token": token, "file": None, "bytes": None, "finished": None}
+    state = {"token": token, "file": None, "bytes": None, "finished": None, "alive": True}
+    write_status(state)      # tell the app right away that the service is running
     if not job:
         state["finished"] = [0, 0, [["job", "No download job was found."]], False]
         write_status(state)
@@ -87,4 +98,12 @@ def main():
             pass
 
 
-main()
+try:
+    main()
+except BaseException:
+    try:
+        with open(os.path.join(jf.PRIV, "iadm_service_error.txt"), "w") as fh:
+            fh.write(traceback.format_exc())
+    except Exception:
+        pass
+    raise
