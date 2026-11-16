@@ -42,7 +42,7 @@ jobs:
       - name: Gather sources
         run: |
           cp iadm_core.py icon.png android/
-          python -m py_compile android/main.py android/iadm_core.py
+          python -m py_compile android/main.py android/service.py android/mediastore.py android/jobfiles.py android/iadm_core.py
 
       - name: Build tools
         run: |
