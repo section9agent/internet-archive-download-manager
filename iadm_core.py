@@ -220,10 +220,11 @@ def fetch_archive_files_note(ident):
         data = json.loads(resp.read().decode("utf-8"))
     if not data or "files" not in data:
         raise ValueError("Item not found, or it has no files.")
-    files, hidden = [], 0
+    files, hidden, private_names = [], 0, set()
     for f in data["files"]:
         if str(f.get("private", "")).lower() == "true":
             hidden += 1
+            private_names.add(f.get("name") or "")
             continue
         name = f.get("name")
         if not name:
@@ -266,18 +267,19 @@ def fetch_archive_files_note(ident):
             if not u.path.startswith(prefix):
                 continue
             name = urllib.parse.unquote(u.path[len(prefix):])
-            if not name or name in have:
-                continue
+            if not name or name in have or name in private_names:
+                continue          # (restricted files are listed on the page but can't be downloaded)
             size, exact = parse_listing_size(trailing)
             files.append({"name": name, "size": size, "exact": exact, "source": "",
                           "url": urllib.parse.urlunparse(u._replace(fragment=""))})
             have.add(name)
             added += 1
-        notes.append(f"metadata listed {len(files) - added} file(s); the download page added {added}")
+        if added:
+            notes.append(f"{added} more file(s) found on the item's download page")
     except Exception as exc:
         notes.append(f"couldn't read the download page ({type(exc).__name__}: {exc})")
     if hidden:
-        notes.append(f"{hidden} restricted file(s) not shown")
+        notes.append(f"{hidden} file(s) are restricted on archive.org and can't be downloaded, so they are not listed")
     try:
         expected = int(data.get("files_count", 0))
     except (TypeError, ValueError):
