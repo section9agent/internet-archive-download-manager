@@ -10,11 +10,11 @@ with the same sub-folders as the website/archive (needs Android 10 or newer).
 """
 
 import json
-import mimetypes
 import os
 import queue
 import re
 import threading
+import time
 import webbrowser
 
 # Android has no system certificate file Python can find, so point HTTPS at certifi's.
@@ -44,6 +44,7 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 import iadm_core as core
+import jobfiles as jf
 
 ON_ANDROID = platform == "android"
 APK_NAME = "InternetArchiveDownloadManager-Android.apk"
@@ -97,118 +98,6 @@ if ON_ANDROID:
 else:
     def set_keep_screen_on(flag):
         pass
-
-
-class _MediaStream:
-    """Write-only stream into a MediaStore file (works like a Python file for the downloader)."""
-
-    def __init__(self, java_stream):
-        self.s = java_stream
-
-    def write(self, data):
-        self.s.write(data)
-
-    def close(self):
-        try:
-            self.s.close()
-        except Exception:
-            pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
-
-
-class MediaStoreSink:
-    """One file being saved into the public Downloads folder (Android 10+)."""
-    offset = 0   # partly downloaded files can't be resumed this way
-
-    def __init__(self, store, name):
-        self.store, self.name, self.uri = store, name, None
-
-    def restart(self):
-        pass
-
-    def open(self):
-        self.uri, stream = self.store.create(self.name)
-        return _MediaStream(stream)
-
-    def commit(self):
-        self.store.finish(self.uri)
-
-    def abort(self):
-        if self.uri is not None:
-            self.store.remove(self.uri)
-            self.uri = None
-
-
-class MediaStoreStore:
-    """Saves into Downloads/<folder>/<sub-folders>/<file> using Android's MediaStore,
-    which needs no storage permission on Android 10 and newer."""
-
-    def __init__(self, folder):
-        from jnius import autoclass
-        self.folder = core.safe_folder_name(folder)
-        self.activity = autoclass("org.kivy.android.PythonActivity").mActivity
-        self.resolver = self.activity.getContentResolver()
-        self.ContentValues = autoclass("android.content.ContentValues")
-        self.Integer = autoclass("java.lang.Integer")
-        self.Cols = autoclass("android.provider.MediaStore$MediaColumns")
-        self.collection = autoclass("android.provider.MediaStore$Downloads").EXTERNAL_CONTENT_URI
-
-    def _where(self, name):
-        parts = [p for p in name.replace("\\", "/").split("/") if p]
-        if not parts or any(p in (".", "..") for p in parts):
-            raise ValueError(f"Unsafe path in listing: {name}")
-        parts = [core.safe_folder_name(p) for p in parts]
-        rel = "Download/" + self.folder + ("/" + "/".join(parts[:-1]) if len(parts) > 1 else "")
-        return rel, parts[-1]
-
-    def is_complete(self, name, size, exact):
-        rel, display = self._where(name)
-        if not (exact and size > 0):
-            return False
-        try:
-            cursor = self.resolver.query(
-                self.collection, [self.Cols.SIZE],
-                f"{self.Cols.RELATIVE_PATH} = ? AND {self.Cols.DISPLAY_NAME} = ?",
-                [rel + "/", display], None)
-            try:
-                return bool(cursor.moveToFirst()) and int(cursor.getLong(0)) == size
-            finally:
-                cursor.close()
-        except Exception:
-            return False
-
-    def begin(self, name):
-        self._where(name)
-        return MediaStoreSink(self, name)
-
-    def create(self, name):
-        rel, display = self._where(name)
-        cv = self.ContentValues()
-        cv.put(self.Cols.DISPLAY_NAME, display)
-        cv.put(self.Cols.MIME_TYPE, mimetypes.guess_type(display)[0] or "application/octet-stream")
-        cv.put(self.Cols.RELATIVE_PATH, rel)
-        cv.put(self.Cols.IS_PENDING, self.Integer(1))
-        uri = self.resolver.insert(self.collection, cv)
-        if uri is None:
-            raise IOError("Android would not create the file")
-        return uri, self.resolver.openOutputStream(uri)
-
-    def finish(self, uri):
-        cv = self.ContentValues()
-        cv.put(self.Cols.IS_PENDING, self.Integer(0))
-        self.resolver.update(uri, cv, None, None)
-
-    def remove(self, uri):
-        try:
-            self.resolver.delete(uri, None, None)
-        except Exception:
-            pass
 
 
 # --------------------------------------------------------------------------
@@ -944,15 +833,22 @@ class Panel(BoxLayout):
         if not selected:
             self.app.message("Nothing selected", "Tick at least one file to download.")
             return
+        if ON_ANDROID:
+            # Hand the job to the background service so it keeps going when the app isn't on screen.
+            dest = "Downloads/" + core.safe_folder_name(self.save_name)
+            try:
+                worker = ServiceLink.launch(selected, self.save_name)
+            except Exception as exc:
+                self.app.message("Can't start the download", str(exc))
+                return
+            self.app.downloading = True
+            ProgressPopup(self.app, worker, worker.events, dest, self.after_download).open()
+            return
         events = queue.Queue()
         try:
-            if ON_ANDROID:
-                store = MediaStoreStore(self.save_name)
-                dest = "Downloads/" + core.safe_folder_name(self.save_name)
-            else:
-                dest = self.save_name
-                os.makedirs(dest, exist_ok=True)
-                store = core.LocalStore(dest)
+            dest = self.save_name
+            os.makedirs(dest, exist_ok=True)
+            store = core.LocalStore(dest)
         except Exception as exc:
             self.app.message("Can't save there", str(exc))
             return
@@ -965,6 +861,90 @@ class Panel(BoxLayout):
     def after_download(self):
         self.app.downloading = False
         set_keep_screen_on(False)
+
+
+class ServiceLink:
+    """Stands in for the downloader while the real work happens in the background service.
+    It looks like a Downloader to the progress window (files, cancel) and turns the
+    service's status file back into the same events."""
+
+    def __init__(self, files):
+        self.files = files
+        self.events = queue.Queue()
+        self.token = None
+        self.seen_file = None
+        self.last_bytes = None
+        self.done = False
+        self.stale_since = time.time()
+        Clock.schedule_interval(self.poll, 0.3)
+
+    @classmethod
+    def launch(cls, files, folder):
+        token = str(time.time())
+        for p in (jf.STATUS, jf.CANCEL):
+            jf.remove(p)
+        jf.write_json(jf.JOB, {"token": token, "files": files, "folder": folder})
+        try:      # Android 13+ only shows the notification once this is allowed
+            from android.permissions import request_permissions
+            request_permissions(["android.permission.POST_NOTIFICATIONS"])
+        except Exception:
+            pass
+        from android import AndroidService
+        AndroidService("Downloading files", "Internet Archive Download Manager").start("go")
+        link = cls(files)
+        link.token = token
+        return link
+
+    @classmethod
+    def reattach(cls):
+        """If a download is still running from before (the app was closed), connect to it again."""
+        job, st = jf.read_json(jf.JOB), jf.read_json(jf.STATUS)
+        if not job or not st or st.get("token") != job.get("token") or st.get("finished"):
+            return None
+        if time.time() - st.get("ts", 0) > 20:
+            return None
+        link = cls(job["files"])
+        link.token = job["token"]
+        link.folder = job["folder"]
+        return link
+
+    def cancel(self):
+        try:
+            with open(jf.CANCEL, "w") as fh:
+                fh.write("1")
+        except OSError:
+            pass
+
+    def poll(self, dt):
+        if self.done:
+            return False
+        st = jf.read_json(jf.STATUS)
+        if st is None or st.get("token") != self.token:
+            if time.time() - self.stale_since > 40:
+                self.finish([0, 0, [["download", "The download service didn't start."]], False])
+                return False
+            return True
+        self.stale_since = time.time()
+        if time.time() - st.get("ts", 0) > 60 and not st.get("finished"):
+            self.finish([0, 0, [["download", "The download service stopped responding."]], False])
+            return False
+        fe = st.get("file")
+        if fe and fe != self.seen_file:
+            self.seen_file = fe
+            self.events.put(("file", *fe))
+        be = st.get("bytes")
+        if be and be != self.last_bytes:
+            self.last_bytes = be
+            self.events.put(("bytes", *be))
+        if st.get("finished"):
+            self.finish(st["finished"])
+            return False
+        return True
+
+    def finish(self, fin):
+        ok, skipped, failed, cancelled = fin
+        self.done = True
+        self.events.put(("finished", ok, skipped, [tuple(x) for x in failed], cancelled))
 
 
 class ProgressPopup(Popup):
@@ -1106,9 +1086,21 @@ class IADMApp(App):
         root.panels = {"archive": Panel("archive"), "dir": Panel("dir")}
         root.select("archive")
         self.root_widget = root
+        Clock.schedule_once(self.try_reattach, 1.5)
         if core.GITHUB_REPO and self.auto_update:
             Clock.schedule_once(lambda dt: self.check_updates(False), 3)
         return root
+
+    def try_reattach(self, dt=None):
+        """The app was closed while the background service kept downloading: show its progress again."""
+        if not ON_ANDROID or self.downloading:
+            return
+        link = ServiceLink.reattach()
+        if link is None:
+            return
+        self.downloading = True
+        dest = "Downloads/" + core.safe_folder_name(getattr(link, "folder", ""))
+        ProgressPopup(self, link, link.events, dest, lambda: setattr(self, "downloading", False)).open()
 
     def update_scale(self):
         """Phones (shortest side under 600 dp) get smaller text and controls; tablets keep the big ones."""
