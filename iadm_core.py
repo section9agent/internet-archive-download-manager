@@ -32,7 +32,7 @@ USER_AGENT = "InternetArchiveDownloadManager/1.0 (personal tool)"
 # Desktop app version (release tags like v1.1.2) and Android app version (tags like android-v1.7).
 # The build workflows rewrite these two lines, so keep each on its own line with nothing after it.
 VERSION = "1.1.2"
-ANDROID_VERSION = "1.7"
+ANDROID_VERSION = "1.9"
 GITHUB_REPO = ""
 GITHUB_API = "https://api.github.com"
 
