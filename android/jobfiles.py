@@ -9,6 +9,15 @@ STATUS = os.path.join(PRIV, "iadm_status.json")  # service -> app: progress
 CANCEL = os.path.join(PRIV, "iadm_cancel")       # app -> service: please stop
 
 
+def set_dir(path):
+    """Use this folder for the shared files (the app tells the service which one)."""
+    global PRIV, JOB, STATUS, CANCEL
+    PRIV = path
+    JOB = os.path.join(PRIV, "iadm_job.json")
+    STATUS = os.path.join(PRIV, "iadm_status.json")
+    CANCEL = os.path.join(PRIV, "iadm_cancel")
+
+
 def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"

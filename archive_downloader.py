@@ -38,8 +38,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from iadm_core import (
     APP_FILE, APP_TITLE, CHUNK, CREDITS, DONATE_URL, FILTER_EXTENSIONS, GITHUB_REPO, SERVICES,
-    USER_AGENT, VERSION, DownloadCancelled, Downloader, crawl_open_directory, fetch_archive_files,
-    fetch_latest_release, folder_name_for_url, human_size, human_time, normalize_dir_url,
+    USER_AGENT, VERSION, DownloadCancelled, Downloader, crawl_open_directory,
+    describe_load, fetch_archive_files_note, fetch_latest_release, folder_name_for_url, human_size, human_time, normalize_dir_url,
     parse_extensions, parse_identifier, safe_folder_name, version_tuple,
 )
 
@@ -1454,6 +1454,7 @@ class SourcePanel(ttk.Frame):
         self.update_count()
         if self.active_extensions():
             self.apply_filter(quiet=True)
+        messagebox.showinfo("Loaded", describe_load(files, note), parent=self)
 
     # ---- Download -----------------------------------------------------
     def start_download(self):
@@ -1510,7 +1511,7 @@ class ArchivePanel(SourcePanel):
             )
             return
         self.pending_id = ident
-        self.start_job(f"Loading '{ident}'...", lambda report, cancelled: (fetch_archive_files(ident), ""))
+        self.start_job(f"Loading '{ident}'...", lambda report, cancelled: fetch_archive_files_note(ident))
 
 
 class OpenDirPanel(SourcePanel):

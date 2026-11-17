@@ -70,10 +70,12 @@ The workflow builds with PyInstaller. `make_icons.py` converts `icon.png` into t
 `android/main.py` is a touch version of the app with the same two tabs, folder tree, file-type filters, dark mode, About window and progress window. It uses the same engine (`iadm_core.py`) as the desktop app and adapts to phone and tablet screens, portrait or landscape.
 
 - Needs **Android 10 or newer**. Files are saved into your public **Downloads** folder, inside a folder named after the item, keeping the sub-folders. No storage permission is needed.
-- Keeps the screen awake while downloading. If you leave the app, downloading may pause when Android freezes it; keep it open for big jobs. Partly downloaded files are not resumed; they restart.
+- Downloads run in a background service with a "Downloading files" notification, so they keep going when you switch apps or turn the screen off. Allow notifications when asked. If the service can't start, the download runs inside the app instead and the app tells you so. On phones with aggressive battery saving, set the app's battery usage to "Unrestricted".
+- Partly downloaded files are not resumed; they restart.
+- After loading, a summary shows how many files were found and anything archive.org is holding back (for example restricted files).
 - Updates: the app checks your GitHub releases and, if a newer APK exists, opens it in your browser to install. (Android doesn't allow silent self-updates.)
 
-**Building the APK:** put `iadm_core.py`, `icon.png` and the `android` folder in your repo with `build-android.yml` in `.github/workflows/`, then run *Build Android APK* from the Actions tab (or push a tag such as `v1.0.0`). It produces `InternetArchiveDownloadManager-Android.apk` and attaches it to a draft release. The first build takes a long time (20-40 minutes).
+**Building the APK:** put `iadm_core.py`, `icon.png` and the `android` folder in your repo with `build-android.yml` in `.github/workflows/`, then run *Build Android APK* from the Actions tab (or push a tag such as `android-v1.7`). The Android app has its own version number, `ANDROID_VERSION` in `iadm_core.py`; the desktop app uses `VERSION` and tags such as `v1.1.2`. Each app only offers updates from releases that contain its own download, so the two version numbers don't interfere. It produces `InternetArchiveDownloadManager-Android.apk` and attaches it to a draft release. The first build takes a long time (20-40 minutes).
 
 **Installing:** download the APK on your device, open it, and allow installs from your browser when asked.
 
@@ -86,6 +88,9 @@ Note: the Android app was tested on a desktop with the same UI code, but not yet
 | `archive_downloader.py` | Desktop app (tkinter)                              |
 | `iadm_core.py`        | Shared engine: listing, crawler, downloader, updates |
 | `android/main.py`     | Android app (Kivy) for phones and tablets            |
+| `android/service.py`  | Android background download service                  |
+| `android/mediastore.py` | Saves files into the Android Downloads folder      |
+| `android/jobfiles.py` | Small files the app and the service share            |
 | `android/buildozer.spec` | Android build settings                            |
 | `.github/workflows/build-android.yml` | Builds the Android APK               |
 | `icon.png`            | App icon (also used for the window icon)             |

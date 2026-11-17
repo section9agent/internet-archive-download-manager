@@ -37,7 +37,6 @@ from kivy.uix.button import Button
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
-from kivy.uix.progressbar import ProgressBar
 from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
@@ -178,6 +177,35 @@ class Tick(Widget):
                              x + side * .80, y + side * .74], width=dp(2.4), cap="round", joint="round")
             elif self.state == "part":
                 Rectangle(pos=(x + side * .24, y + side * .43), size=(side * .52, side * .14))
+
+
+class Bar(Widget):
+    """A progress bar we draw ourselves (Kivy's own bar has a fixed thickness)."""
+    value = NumericProperty(0)
+    max = NumericProperty(100)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bind(pos=self.redraw, size=self.redraw, value=self.redraw, max=self.redraw)
+        app = App.get_running_app()
+        if app is not None:
+            app.bind(theme_rev=self.redraw)
+        self.redraw()
+
+    def redraw(self, *args):
+        app = App.get_running_app()
+        if app is None:
+            return
+        frac = 0 if self.max <= 0 else min(1.0, max(0.0, self.value / self.max))
+        self.canvas.clear()
+        with self.canvas:
+            Color(*app.tick_border)
+            Rectangle(pos=self.pos, size=self.size)
+            Color(*app.button)
+            Rectangle(pos=(self.x + dp(1.5), self.y + dp(1.5)), size=(self.width - dp(3), self.height - dp(3)))
+            Color(*app.accent)
+            Rectangle(pos=(self.x + dp(1.5), self.y + dp(1.5)),
+                      size=((self.width - dp(3)) * frac, self.height - dp(3)))
 
 
 class Expander(Label):
@@ -638,8 +666,7 @@ class Panel(BoxLayout):
         if self.active_extensions():
             self.apply_filter(quiet=True)
         self.refresh()
-        if note and self.kind == "archive":
-            self.app.message("Loaded", f"{len(self.file_nodes)} files.\n\n{note}\n\n(App version {core.VERSION})")
+        self.app.message("Loaded", core.describe_load(files, note))
 
     # ---- list ---------------------------------------------------------------
     def refresh(self):
@@ -915,11 +942,19 @@ class ServiceLink:
             request_permissions(["android.permission.POST_NOTIFICATIONS"])
         except Exception:
             pass
-        from android import AndroidService
-        AndroidService("Downloading files", "Internet Archive Download Manager").start("go")
+        jf.remove(os.path.join(jf.PRIV, "iadm_service_error.txt"))
+        # Start the service declared in buildozer.spec ("services = Downloader:service.py:foreground").
+        # python-for-android generates it as <package>.ServiceDownloader.
         link = cls(files)
         link.token = token
         link.folder = folder
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            service = autoclass(activity.getPackageName() + ".ServiceDownloader")
+            service.start(activity, jf.PRIV)
+        except Exception as exc:
+            link.run_in_app(f"Couldn't start the service ({type(exc).__name__}: {exc})")
         return link
 
     @classmethod
@@ -997,10 +1032,11 @@ class ProgressPopup(Popup):
         mk = lambda **k: Label(color=app.fg, font_size=app.fs, halign="left", valign="middle",
                                size_hint_y=None, height=dp(34), **k)
         self.l_file = mk(text="Starting...")
-        self.p_file = ProgressBar(max=100, size_hint_y=None, height=dp(16))
+        bar_h = dp(24) * app.u
+        self.p_file = Bar(max=100, size_hint_y=None, height=bar_h)
         self.l_file2 = mk(text="")
         self.l_total = mk(text="Overall progress")
-        self.p_total = ProgressBar(max=100, size_hint_y=None, height=dp(16))
+        self.p_total = Bar(max=100, size_hint_y=None, height=bar_h)
         self.l_total2 = mk(text=f"Saving to {dest}")
         for w in (self.l_file, self.p_file, self.l_file2, self.l_total, self.p_total, self.l_total2):
             if isinstance(w, Label):
@@ -1112,6 +1148,8 @@ class IADMApp(App):
     def build(self):
         self.downloading = False
         self.popups = []
+        if ON_ANDROID:
+            jf.set_dir(self.user_data_dir)    # shared with the background service
         self.update_scale()
         Window.bind(size=lambda *a: self.update_scale())
         self.cfg = self.load_config()
@@ -1260,7 +1298,7 @@ class IADMApp(App):
         if os.path.exists("icon.png"):
             col.add_widget(Image(source="icon.png", size_hint_y=None, height=dp(96)))
         text(core.APP_TITLE, bold=True, size=self.fs * 1.2)
-        text(f"Version {core.VERSION}")
+        text(f"Version {core.ANDROID_VERSION}")
         text("Coded by Claude & Emmanuel Hoachlander", bold=True)
         text("If you enjoy this program, please consider a donation.")
         donate = Builder.load_string("Btn:\n    text: 'Donate with PayPal'")
@@ -1324,15 +1362,15 @@ class IADMApp(App):
             if manual:
                 self.message("Updates", "No releases have been published yet.")
             return
-        if release["version"] <= core.version_tuple(core.VERSION):
+        if release["version"] <= core.version_tuple(core.ANDROID_VERSION):
             if manual:
-                self.message("Updates", f"You're up to date (version {core.VERSION}).")
+                self.message("Updates", f"You're up to date (version {core.ANDROID_VERSION}).")
             return
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        shown = (release["tag"] or "").lstrip("vV") or "a newer version"
+        shown = re.sub(r"^(android-)?v", "", release["tag"] or "", flags=re.I) or "a newer version"
         notes = release["notes"][:1500] or "No release notes."
         scroll = ScrollView()
-        lbl = Label(text=f"You have version {core.VERSION}.\n\n{notes}\n\nTap Download, then open the file "
+        lbl = Label(text=f"You have version {core.ANDROID_VERSION}.\n\n{notes}\n\nTap Download, then open the file "
                          "to install it over the old one.", color=self.fg, font_size=self.fs, halign="left",
                     valign="top", size_hint_y=None, text_size=(popup_size()[0] - dp(40), None))
         lbl.bind(texture_size=lambda i, v: setattr(i, "height", v[1]))

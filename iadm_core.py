@@ -29,7 +29,10 @@ USER_AGENT = "InternetArchiveDownloadManager/1.0 (personal tool)"
 # The release workflow stamps these two lines when it builds a tagged release.
 # Building by hand? Set GITHUB_REPO to "your-name/your-repo" so the update check knows
 # where to look (leave it empty to switch update checks off).
-VERSION = "1.0.0"
+# Desktop app version (release tags like v1.1.2) and Android app version (tags like android-v1.7).
+# The build workflows rewrite these two lines, so keep each on its own line with nothing after it.
+VERSION = "1.1.2"
+ANDROID_VERSION = "1.7"
 GITHUB_REPO = ""
 GITHUB_API = "https://api.github.com"
 
@@ -176,25 +179,39 @@ def open_url(url, headers=None, timeout=30, method=None):
 
 
 def version_tuple(text):
-    """'v1.2.3' -> (1, 2, 3, 0). Anything after a '-' or '+' is ignored."""
-    nums = re.findall(r"\d+", (text or "").split("-")[0].split("+")[0])
+    """'v1.2.3' or 'android-v1.7' -> (1, 2, 3, 0) / (1, 7, 0, 0). Anything after the numbers is
+    ignored, and tags that aren't versions (like 'build-12') count as 0."""
+    m = re.match(r"(?:android-)?v?(\d+(?:\.\d+)*)", (text or "").strip(), re.I)
+    nums = m.group(1).split(".") if m else []
     return tuple(int(n) for n in nums[:4]) + (0,) * (4 - len(nums[:4]))
 
 
 def fetch_latest_release(repo, asset_name):
-    """Newest published (non-draft, non-prerelease) GitHub release, or None if there is none.
-
-    asset_name is the file to look for among the release's downloads."""
-    url = f"{GITHUB_API}/repos/{repo}/releases/latest"
+    """Newest published (non-draft, non-prerelease) GitHub release that contains asset_name,
+    or None if there is none. The desktop and Android apps share one repository but have their
+    own version numbers, so each only looks at releases that carry its own download."""
+    url = f"{GITHUB_API}/repos/{repo}/releases?per_page=30"
     try:
         with open_url(url, headers={"Accept": "application/vnd.github+json"}, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            releases = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
         raise
+    best = None
+    for rel in releases if isinstance(releases, list) else []:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        found = next((a for a in rel.get("assets", []) if a.get("name") == asset_name), None)
+        if found is None:
+            continue
+        ver = version_tuple(rel.get("tag_name") or "")
+        if best is None or ver > best[0]:
+            best = (ver, rel, found)
+    if best is None:
+        return None
+    _, data, asset = best
     tag = data.get("tag_name") or ""
-    asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
     return {
         "tag": tag,
         "version": version_tuple(tag),
@@ -289,6 +306,18 @@ def fetch_archive_files_note(ident):
     if data.get("is_dark"):
         notes.append("this item is disabled/restricted on archive.org")
     return files, "; ".join(notes)
+
+
+def describe_load(files, note=""):
+    """Plain-language summary shown after a site or archive has been loaded."""
+    total = sum(max(f["size"], 0) for f in files)
+    lines = [f"Found {len(files)} file(s), {human_size(total)} in total."]
+    unknown = sum(1 for f in files if f["size"] < 0)
+    if unknown:
+        lines.append(f"{unknown} file(s) don't have a size listed.")
+    for n in filter(None, (note or "").split("; ")):
+        lines.append("- " + n)
+    return "\n".join(lines)
 
 
 class _LinkParser(html.parser.HTMLParser):

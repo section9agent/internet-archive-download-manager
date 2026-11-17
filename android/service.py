@@ -11,8 +11,11 @@ import traceback
 try:
     import iadm_core as core
     import jobfiles as jf
+    _arg = os.environ.get("PYTHON_SERVICE_ARGUMENT")
+    if _arg and os.path.isabs(_arg):
+        jf.set_dir(_arg)          # the app tells us which folder to share files in
 except BaseException:
-    for _d in (os.environ.get("ANDROID_PRIVATE"), os.getcwd()):
+    for _d in (os.environ.get("PYTHON_SERVICE_ARGUMENT"), os.environ.get("ANDROID_PRIVATE"), os.getcwd()):
         try:
             with open(os.path.join(_d, "iadm_service_error.txt"), "w") as _fh:
                 _fh.write(traceback.format_exc())

@@ -1,10 +1,10 @@
 name: Build Android APK
 on:
-  push: { tags: ["v*"] }
+  push: { tags: ["android-v*"] }
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag for the draft (e.g. v1.0.1). Leave empty for a build-number tag."
+        description: "Android version for the draft release (e.g. 1.8 or android-v1.8). Leave empty to use the version already in iadm_core.py."
         required: false
         default: ""
 jobs:
@@ -23,21 +23,23 @@ jobs:
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}";
-          elif [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG";
-          else TAG="build-${GITHUB_RUN_NUMBER}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          V="${TAG#v}"
-          if ! echo "$V" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then V="1.0.0"; fi
+          # The Android app has its own version number (ANDROID_VERSION in iadm_core.py) and its
+          # releases are tagged android-v<version>, separate from the desktop app's v<version> tags.
+          FILE_V=$(sed -n -E 's/^ANDROID_VERSION = "([^"]*)".*/\1/p' iadm_core.py)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then RAW="${GITHUB_REF_NAME}"; else RAW="$INPUT_TAG"; fi
+          V="${RAW#android-}"; V="${V#v}"
+          if ! echo "$V" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then V="$FILE_V"; fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=android-v$V" >> "$GITHUB_OUTPUT"
+          echo "Android version: $V"
 
       - name: Stamp version and repository
         shell: bash
         run: |
-          sed -i -E "s/^VERSION = .*/VERSION = \"${{ steps.ver.outputs.version }}\"/" iadm_core.py
+          sed -i -E "s/^ANDROID_VERSION = .*/ANDROID_VERSION = \"${{ steps.ver.outputs.version }}\"/" iadm_core.py
           sed -i -E "s|^GITHUB_REPO = .*|GITHUB_REPO = \"${{ github.repository }}\"|" iadm_core.py
           sed -i -E "s/^version = .*/version = ${{ steps.ver.outputs.version }}/" android/buildozer.spec
-          grep -nE '^(VERSION|GITHUB_REPO) =' iadm_core.py
+          grep -nE '^(ANDROID_VERSION|GITHUB_REPO) =' iadm_core.py
 
       - name: Gather sources
         run: |

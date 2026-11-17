@@ -4,7 +4,7 @@ package.name = iadownloadmanager
 package.domain = org.iadm
 source.dir = .
 source.include_exts = py,png,jpg,kv,json
-version = 1.6
+version = 1.7
 requirements = python3,kivy==2.3.0,pyjnius,android,certifi,openssl
 orientation = portrait, landscape
 fullscreen = 0
