@@ -890,6 +890,40 @@ class Panel(BoxLayout):
         set_keep_screen_on(False)
 
 
+def service_diagnostics(start_note=""):
+    """Everything we can find out about why the background service didn't answer."""
+    lines = [f"App version {core.ANDROID_VERSION}"]
+    if start_note:
+        lines.append(start_note)
+    try:
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        pkg = activity.getPackageName()
+        lines.append(f"Android API {autoclass('android.os.Build$VERSION').SDK_INT}, "
+                     f"target {activity.getApplicationInfo().targetSdkVersion}")
+        info = activity.getPackageManager().getPackageInfo(pkg, 4)      # 4 = GET_SERVICES
+        names = [s.name.split(".")[-1] for s in (info.services or [])]
+        lines.append("Services in this build: " + (", ".join(names) or "none"))
+    except Exception as exc:
+        lines.append(f"(couldn't read app info: {exc})")
+    for label, name in (("Service log", "iadm_service_boot.txt"), ("Service error", "iadm_service_error.txt")):
+        try:
+            with open(os.path.join(jf.PRIV, name), "r") as fh:
+                lines.append(f"{label}:\n{fh.read()[-700:].strip()}")
+        except OSError:
+            lines.append(f"{label}: (none - the service's Python never ran)" if "log" in label else f"{label}: none")
+    try:
+        import subprocess
+        out = subprocess.run(["logcat", "-d", "-t", "600"], capture_output=True, timeout=6).stdout.decode("utf-8", "replace")
+        keys = ("ServiceDownloader", "PythonService", "python service", "AndroidRuntime", "FATAL", "ForegroundService",
+                "startForeground", "service_Downloader", "Unable to start service", "Background start not allowed")
+        hits = [ln[-220:] for ln in out.splitlines() if any(k in ln for k in keys)]
+        lines.append("System log:\n" + ("\n".join(hits[-25:]) if hits else "(nothing relevant)"))
+    except Exception as exc:
+        lines.append(f"(couldn't read the system log: {exc})")
+    return "\n".join(lines)
+
+
 class ServiceLink:
     """Stands in for the downloader while the real work happens in the background service.
     It looks like a Downloader to the progress window (files, cancel) and turns the
@@ -925,11 +959,19 @@ class ServiceLink:
         except Exception as exc:
             self.finish([0, 0, [["download", f"{reason}\n{exc}"]], False])
             return
+        details = reason
+        try:
+            details = service_diagnostics(reason)
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(details)
+        except Exception:
+            pass
         app = App.get_running_app()
         if app is not None:
             app.message("Background downloading unavailable",
                         "The background download service didn't start, so this download is running inside "
-                        "the app instead. Keep the app open until it finishes.\n\n" + reason)
+                        "the app instead. Keep the app open until it finishes.\n\n"
+                        "The details below were copied to the clipboard.\n\n" + details)
 
     @classmethod
     def launch(cls, files, folder):
@@ -943,6 +985,7 @@ class ServiceLink:
         except Exception:
             pass
         jf.remove(os.path.join(jf.PRIV, "iadm_service_error.txt"))
+        jf.remove(os.path.join(jf.PRIV, "iadm_service_boot.txt"))
         # Start the service declared in buildozer.spec ("services = Downloader:service.py:foreground").
         # python-for-android generates it as <package>.ServiceDownloader.
         link = cls(files)
@@ -987,15 +1030,10 @@ class ServiceLink:
             return False        # the in-app downloader reports through self.events itself
         st = jf.read_json(jf.STATUS)
         if st is None or st.get("token") != self.token:
-            if time.time() - self.stale_since > 15:
-                reason = "No response from the service."
-                err = os.path.join(jf.PRIV, "iadm_service_error.txt")
-                try:
-                    with open(err, "r") as fh:
-                        reason = "Service error:\n" + fh.read()[-600:]
-                except OSError:
-                    pass
-                self.run_in_app(reason)
+            # Give it 15 seconds; a little longer if the service's Python has at least started.
+            started = os.path.exists(os.path.join(jf.PRIV, "iadm_service_boot.txt"))
+            if time.time() - self.stale_since > (30 if started else 15):
+                self.run_in_app("The service was asked to start but sent no progress.")
                 return False
             return True
         self.stale_since = time.time()

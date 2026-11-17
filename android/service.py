@@ -4,9 +4,25 @@ when the app is not on screen. The app hands it a job file and reads progress fr
 """
 
 import os
-import queue
 import time
-import traceback
+
+
+def mark(text):
+    """Leave a breadcrumb the app can read, so a service that fails early can be diagnosed."""
+    for d in (os.environ.get("PYTHON_SERVICE_ARGUMENT"), os.environ.get("ANDROID_PRIVATE")):
+        if d and os.path.isabs(d):
+            try:
+                with open(os.path.join(d, "iadm_service_boot.txt"), "a") as fh:
+                    fh.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+            except Exception:
+                pass
+
+
+mark(f"python started (arg={os.environ.get('PYTHON_SERVICE_ARGUMENT')!r}, "
+     f"private={os.environ.get('ANDROID_PRIVATE')!r}, cwd={os.getcwd()!r})")
+
+import queue          # noqa: E402
+import traceback      # noqa: E402
 
 try:
     import iadm_core as core
@@ -14,7 +30,9 @@ try:
     _arg = os.environ.get("PYTHON_SERVICE_ARGUMENT")
     if _arg and os.path.isabs(_arg):
         jf.set_dir(_arg)          # the app tells us which folder to share files in
+    mark(f"modules loaded, sharing files in {jf.PRIV!r}")
 except BaseException:
+    mark("import failed: " + traceback.format_exc()[-400:])
     for _d in (os.environ.get("PYTHON_SERVICE_ARGUMENT"), os.environ.get("ANDROID_PRIVATE"), os.getcwd()):
         try:
             with open(os.path.join(_d, "iadm_service_error.txt"), "w") as _fh:
@@ -38,6 +56,7 @@ def main():
     token = job.get("token") if job else None
     state = {"token": token, "file": None, "bytes": None, "finished": None, "alive": True}
     write_status(state)      # tell the app right away that the service is running
+    mark(f"job {'found' if job else 'NOT found'} at {jf.JOB!r}; status written: {os.path.exists(jf.STATUS)}")
     if not job:
         state["finished"] = [0, 0, [["job", "No download job was found."]], False]
         write_status(state)
